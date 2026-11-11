@@ -1,7 +1,6 @@
 package com.seca.phone
 
 import android.Manifest
-import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -19,33 +18,23 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.res.stringResource
 import androidx.core.content.edit
 import com.seca.core.contacts.PhoneNumbers
 import com.seca.core.design.SecaIcons
-import com.seca.core.design.component.SecaGroupItem
-import com.seca.core.design.component.SecaSectionLabel
-import com.seca.core.design.component.SecaSettingRow
 import com.seca.core.design.component.segmentShape
-import androidx.compose.ui.res.stringResource
 
 /** A SIM able to place calls. [slot] counts from 1, when Android tells it. */
 internal data class Sim(val handle: PhoneAccountHandle, val label: String, val slot: Int?) {
@@ -70,31 +59,25 @@ internal fun callingSims(context: Context): List<Sim> {
     }.getOrDefault(emptyList())
 }
 
-/** The SIM each contact is called with, once the owner chose it. Kept on this phone only. */
+/**
+ * Compatibility shim for callers from older versions. SIM choices are no longer
+ * persisted: previous saved choices are cleared and reads/writes are ignored.
+ */
 internal class SimPreferences(context: Context) {
-
     private val prefs = context.getSharedPreferences("seca_sim_choice", Context.MODE_PRIVATE)
 
-    operator fun get(key: String): PhoneAccountHandle? {
-        val saved = prefs.getString(key, null) ?: return null
-        val component = ComponentName.unflattenFromString(saved.substringBefore(SEPARATOR)) ?: return null
-        return PhoneAccountHandle(component, saved.substringAfter(SEPARATOR))
+    init {
+        prefs.edit { clear() }
     }
 
-    operator fun set(key: String, handle: PhoneAccountHandle) {
-        prefs.edit { putString(key, handle.componentName.flattenToString() + SEPARATOR + handle.id) }
-    }
+    operator fun get(key: String): PhoneAccountHandle? = null
 
-    fun forget(key: String) {
-        prefs.edit { remove(key) }
-    }
+    operator fun set(key: String, handle: PhoneAccountHandle) = Unit
 
-    private companion object {
-        const val SEPARATOR = '|'
-    }
+    fun forget(key: String) = Unit
 }
 
-/** A contact is remembered by its lookup key, which outlives a change of number; anyone else by their number. */
+/** A contact is identified by its lookup key; a number without a contact by its normalized number. */
 internal fun simKeyOf(lookupKey: String?, number: String, numbers: PhoneNumbers): String =
     if (lookupKey.isNullOrEmpty()) "number:${numbers.key(number)}" else "contact:$lookupKey"
 
@@ -111,7 +94,7 @@ internal fun contactFor(context: Context, number: String): Pair<String, String>?
 
 /** Before a call: the SIM to place it with, or the choice to offer. */
 internal sealed interface SimRoute {
-    /** [account] null lets Android pick, as with a single SIM. */
+    /** [account] null lets Android pick, as with a single SIM or an emergency call. */
     data class Direct(val account: PhoneAccountHandle?) : SimRoute
 
     data class Ask(
@@ -119,67 +102,47 @@ internal sealed interface SimRoute {
         val sims: List<Sim>,
         val key: String,
         val contactName: String?,
-        /**
-         * This call only: nothing is remembered afterwards, and the SIM the contact is
-         * usually called with is marked so that the exception is visibly an exception.
-         */
+        /** Retained for compatibility; no choice is remembered, including on one-off calls. */
         val once: Boolean = false,
+        /** Retained for compatibility; there is no remembered usual SIM. */
         val usual: PhoneAccountHandle? = null,
     ) : SimRoute
 }
 
 /**
- * With several SIMs, a contact is called with the SIM chosen for them, and
- * the owner is asked otherwise. An emergency number never waits for a choice.
+ * Every non-emergency call on a multi-SIM phone asks which SIM to use. The answer
+ * applies to this call only and is never saved. Emergency numbers bypass the chooser.
  */
 internal fun routeCall(context: Context, number: String): SimRoute {
     val sims = callingSims(context)
     if (sims.size < 2 || isEmergency(context, number)) return SimRoute.Direct(null)
     val contact = contactFor(context, number)
     val key = simKeyOf(contact?.first, number, PhoneNumbers(PhoneNumbers.detectRegion(context)))
-    val preferred = SimPreferences(context)[key]?.takeIf { saved -> sims.any { it.handle == saved } }
-    return if (preferred != null) SimRoute.Direct(preferred) else SimRoute.Ask(number, sims, key, contact?.second?.ifEmpty { null })
+    return SimRoute.Ask(number, sims, key, contact?.second?.ifEmpty { null })
 }
 
-/**
- * The same, for a call the owner asked to place on a particular SIM this once.
- *
- * Reached by holding the call button down rather than tapping it. Nothing is written: the
- * contact goes on being called with whatever they were called with before, which is the
- * whole point - a one-off that changed the setting would not be a one-off.
- */
+/** The long-press call action follows the same ask-every-time, never-save behavior. */
 internal fun routeCallOnce(context: Context, number: String): SimRoute {
-    val sims = callingSims(context)
-    if (sims.size < 2 || isEmergency(context, number)) return SimRoute.Direct(null)
-    val contact = contactFor(context, number)
-    val key = simKeyOf(contact?.first, number, PhoneNumbers(PhoneNumbers.detectRegion(context)))
-    return SimRoute.Ask(
-        number = number,
-        sims = sims,
-        key = key,
-        contactName = contact?.second?.ifEmpty { null },
-        once = true,
-        usual = SimPreferences(context)[key]?.takeIf { saved -> sims.any { it.handle == saved } },
-    )
+    val route = routeCall(context, number)
+    return when (route) {
+        is SimRoute.Direct -> route
+        is SimRoute.Ask -> route.copy(once = true)
+    }
 }
 
 private fun isEmergency(context: Context, number: String): Boolean =
     runCatching { context.getSystemService(TelephonyManager::class.java)?.isEmergencyNumber(number) == true }.getOrDefault(true)
 
-/**
- * Which SIM to use. With [rememberLabel], a box keeps the choice for the next
- * calls; it starts ticked, since a contact is usually called with the same SIM.
- */
+/** A per-call SIM chooser. It deliberately has no remember option or usual-SIM indicator. */
 @Composable
 internal fun SimChooserDialog(
     sims: List<Sim>,
     title: String,
-    rememberLabel: String?,
+    @Suppress("UNUSED_PARAMETER") rememberLabel: String?,
     onDismiss: () -> Unit,
     onPick: (sim: Sim, remember: Boolean) -> Unit,
-    usual: PhoneAccountHandle? = null,
+    @Suppress("UNUSED_PARAMETER") usual: PhoneAccountHandle? = null,
 ) {
-    var keep by remember { mutableStateOf(true) }
     val colors = MaterialTheme.colorScheme
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -194,7 +157,7 @@ internal fun SimChooserDialog(
                             .fillMaxWidth()
                             .clip(segmentShape(index, sims.size, outer = 20.dp))
                             .background(colors.surfaceContainerHighest)
-                            .clickable(onClickLabel = sim.name) { onPick(sim, keep) }
+                            .clickable(onClickLabel = sim.name) { onPick(sim, false) }
                             .padding(horizontal = 16.dp, vertical = 14.dp),
                     ) {
                         Box(
@@ -210,23 +173,13 @@ internal fun SimChooserDialog(
                                 color = colors.onPrimaryContainer,
                             )
                         }
-                        Column(Modifier.padding(start = 16.dp)) {
-                            Text(sim.label, style = MaterialTheme.typography.titleMedium, color = colors.onSurface)
-                            // Which one this contact is usually called with, so that choosing
-                            // the other is seen to be the exception it is.
-                            val under = when {
-                                sim.handle == usual -> stringResource(R.string.sim_usual, sim.slot ?: sim.label)
-                                sim.slot != null -> "SIM ${sim.slot}"
-                                else -> null
-                            }
-                            under?.let {
-                                Text(it, style = MaterialTheme.typography.bodyMedium, color = colors.onSurfaceVariant)
-                            }
-                        }
+                        Text(
+                            text = sim.label,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = colors.onSurface,
+                            modifier = Modifier.padding(start = 16.dp),
+                        )
                     }
-                }
-                rememberLabel?.let { label ->
-                    RememberChoice(keep, label, onCheckedChange = { keep = it }, modifier = Modifier.padding(top = 12.dp))
                 }
             }
         },
@@ -234,68 +187,10 @@ internal fun SimChooserDialog(
     )
 }
 
-/** The box that keeps a SIM for a contact's next calls, its whole line a touch target. */
-@Composable
-internal fun RememberChoice(checked: Boolean, label: String, onCheckedChange: (Boolean) -> Unit, modifier: Modifier = Modifier) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = modifier
-            .fillMaxWidth()
-            .clip(MaterialTheme.shapes.large)
-            .toggleable(value = checked, role = Role.Checkbox, onValueChange = onCheckedChange)
-            .padding(vertical = 4.dp),
-    ) {
-        Checkbox(checked = checked, onCheckedChange = null)
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.padding(start = 12.dp),
-        )
-    }
-}
-
-/** On a contact's page, with several SIMs: the SIM their calls use, to change or to forget. */
+/** Per-contact SIM preferences are disabled; multi-SIM calls always ask at call time. */
+@Suppress("UNUSED_PARAMETER")
 @Composable
 internal fun SimPreferenceRow(number: String, lookupKey: String?, name: String, numbers: PhoneNumbers) {
-    val context = LocalContext.current
-    val sims = remember { callingSims(context) }
-    if (sims.size < 2) return
-    val preferences = remember { SimPreferences(context) }
-    val key = remember(number, lookupKey) { simKeyOf(lookupKey, number, numbers) }
-    var preferred by remember(key) { mutableStateOf(preferences[key]?.let { saved -> sims.firstOrNull { it.handle == saved } }) }
-    var choosing by remember { mutableStateOf(false) }
-    Column {
-        SecaSectionLabel(stringResource(R.string.sim_card))
-        SecaGroupItem(index = 0, count = 1, onClick = { choosing = true }) {
-            SecaSettingRow(
-                icon = SecaIcons.Phone,
-                title = preferred?.name ?: stringResource(R.string.ask_every_call),
-                subtitle = stringResource(if (preferred != null) R.string.sim_for_calling else R.string.sim_tap_to_choose, name),
-                trailing = preferred?.let {
-                    {
-                        TextButton(
-                            onClick = {
-                                preferences.forget(key)
-                                preferred = null
-                            },
-                        ) { Text(stringResource(R.string.forget)) }
-                    }
-                },
-            )
-        }
-    }
-    if (choosing) {
-        SimChooserDialog(
-            sims = sims,
-            title = stringResource(R.string.sim_for, name),
-            rememberLabel = null,
-            onDismiss = { choosing = false },
-            onPick = { sim, _ ->
-                preferences[key] = sim.handle
-                preferred = sim
-                choosing = false
-            },
-        )
-    }
+    // Intentionally empty: there is no per-contact SIM setting to save or display.
+    LocalContext.current
 }
