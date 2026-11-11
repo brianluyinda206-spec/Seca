@@ -24,13 +24,11 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
-        run: |
-          sdkmanager --install \
-            "platforms;android-37" \
-            "build-tools;36.0.0" \
-            "ndk;28.0.13004108"
+        with:
+          packages: |
+            platforms;android-37
+            build-tools;36.0.0
+            ndk;28.0.13004108
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
